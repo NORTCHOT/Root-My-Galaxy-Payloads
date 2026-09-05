@@ -1,5 +1,15 @@
 #include "common.h"
 
+/*
+ * Supervisor timeout overrides.
+ * We #undef first to guarantee these take precedence over any values
+ * that may have leaked in from target.h (which defines generous limits
+ * for the native payload itself).
+ */
+#undef DEFAULT_EXPLOIT_ATTEMPTS
+#undef DEFAULT_ATTEMPT_TIMEOUT_SEC
+#undef DEFAULT_P0_ATTEMPT_TIMEOUT_SEC
+
 #ifndef DEFAULT_EXPLOIT_ATTEMPTS
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
 #define DEFAULT_EXPLOIT_ATTEMPTS 24
@@ -9,10 +19,10 @@
 #endif
 #define DEFAULT_PSELECT_DELAY_USEC 20000
 #ifndef DEFAULT_ATTEMPT_TIMEOUT_SEC
-#define DEFAULT_ATTEMPT_TIMEOUT_SEC 90
+#define DEFAULT_ATTEMPT_TIMEOUT_SEC 300
 #endif
 #ifndef DEFAULT_P0_ATTEMPT_TIMEOUT_SEC
-#define DEFAULT_P0_ATTEMPT_TIMEOUT_SEC 20
+#define DEFAULT_P0_ATTEMPT_TIMEOUT_SEC 90
 #endif
 #define APP_MIN_BOOT_UPTIME_SEC 120
 
@@ -116,9 +126,9 @@ __attribute__((constructor)) static void load(void) {
   int base_delay = env_int(
       "PSELECT_DELAY_USEC", DEFAULT_PSELECT_DELAY_USEC, 0, 1000000);
   int attempt_timeout_sec = env_int(
-      "EXPLOIT_ATTEMPT_TIMEOUT_SEC", DEFAULT_ATTEMPT_TIMEOUT_SEC, 5, 900);
+      "EXPLOIT_ATTEMPT_TIMEOUT_SEC", DEFAULT_ATTEMPT_TIMEOUT_SEC, 300, 900);
   int p0_attempt_timeout_sec = env_int(
-      "P0_ATTEMPT_TIMEOUT_SEC", DEFAULT_P0_ATTEMPT_TIMEOUT_SEC, 5,
+      "P0_ATTEMPT_TIMEOUT_SEC", DEFAULT_P0_ATTEMPT_TIMEOUT_SEC, 90,
       attempt_timeout_sec);
   if (p0_attempt_timeout_sec > attempt_timeout_sec) {
     p0_attempt_timeout_sec = attempt_timeout_sec;
